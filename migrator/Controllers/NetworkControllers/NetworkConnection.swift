@@ -22,6 +22,13 @@ private actor SymlinksManager {
         symlinks.append(link)
     }
     
+    /// Inserts symbolic link messages at the front of the collection.
+    /// Used to restore unsent links if sending fails mid-flight.
+    func prepend(_ links: [SymbolicLinkMessage]) {
+        guard !links.isEmpty else { return }
+        symlinks.insert(contentsOf: links, at: 0)
+    }
+    
     /// Returns all collected symlinks and clears the internal collection.
     func takeAll() -> [SymbolicLinkMessage] {
         let result = symlinks
@@ -604,15 +611,28 @@ final class NetworkConnection {
     private func sendSymlinks() async throws {
         logger.log("networkConnection.sendSymlinks: start sending collected symlinks")
         let linksToSend = await symlinksManager.takeAll()
-        for symlink in linksToSend {
-            guard var data = "link".data(using: .utf8),
-                  let infoDataLenght = try? data.include(object: symlink) else {
-                throw MigratorError.fileError(type: .noData)
+        guard !linksToSend.isEmpty else {
+            logger.log("networkConnection.sendSymlinks: no symlinks queued")
+            return
+        }
+        var nextIndexToResend = 0
+        do {
+            for (index, symlink) in linksToSend.enumerated() {
+                nextIndexToResend = index
+                guard var data = "link".data(using: .utf8),
+                      let infoDataLenght = try? data.include(object: symlink) else {
+                    throw MigratorError.fileError(type: .noData)
+                }
+                let message = NWProtocolFramer.Message(migratorMessageType: .symlink, infoLenght: UInt32(infoDataLenght))
+                let context = NWConnection.ContentContext(identifier: "SymbolicLink",
+                                                          metadata: [message])
+                try await sendAsyncWrapper(content: data, contentContext: context)
             }
-            let message = NWProtocolFramer.Message(migratorMessageType: .symlink, infoLenght: UInt32(infoDataLenght))
-            let context = NWConnection.ContentContext(identifier: "SymbolicLink",
-                                                      metadata: [message])
-            try await sendAsyncWrapper(content: data, contentContext: context)
+        } catch {
+            let unsent = Array(linksToSend[nextIndexToResend...])
+            await symlinksManager.prepend(unsent)
+            logger.log("networkConnection.sendSymlinks: error sending symlinks, requeued \(unsent.count) links", type: .error)
+            throw error
         }
         logger.log("networkConnection.sendSymlinks: done sending collected symlinks")
     }
