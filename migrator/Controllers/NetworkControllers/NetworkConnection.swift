@@ -12,6 +12,24 @@ import Foundation
 import Network
 import Combine
 
+/// Thread-safe manager for collecting symbolic links during file transfers.
+/// This actor prevents race conditions when multiple async tasks append symlinks concurrently.
+private actor SymlinksManager {
+    private var symlinks: [SymbolicLinkMessage] = []
+    
+    /// Appends a symbolic link message to the collection.
+    func append(_ link: SymbolicLinkMessage) {
+        symlinks.append(link)
+    }
+    
+    /// Returns all collected symlinks and clears the internal collection.
+    func takeAll() -> [SymbolicLinkMessage] {
+        let result = symlinks
+        symlinks = []
+        return result
+    }
+}
+
 /// Represents and manages a network connection, handling both incoming and outgoing data transfer.
 final class NetworkConnection {
     
@@ -66,8 +84,8 @@ final class NetworkConnection {
             }
         }
     }
-    /// Stores symbolic link messages that need to be sent to the connected device.
-    var symlinks: [SymbolicLinkMessage] = []
+    /// Thread-safe manager for symbolic link messages that need to be sent to the connected device.
+    private let symlinksManager = SymlinksManager()
     /// Provides the current state of the network connection.
     var state: NWConnection.State {
         return connection.state
@@ -298,10 +316,10 @@ final class NetworkConnection {
                 
                 if destinationTrackedURL.source == .unknown {
                     let infoData = SymbolicLinkMessage(source: sourceTrackedURL, absoluteDestination: MigratorFileURL(with: file.url.fullURL().deletingLastPathComponent()), relativeDestination: destinationPath)
-                    symlinks.append(infoData)
+                    await symlinksManager.append(infoData)
                 } else {
                     let infoData = SymbolicLinkMessage(source: sourceTrackedURL, absoluteDestination: MigratorFileURL(with: URL(string: destinationPath)!))
-                    symlinks.append(infoData)
+                    await symlinksManager.append(infoData)
                 }
                 return
             } catch {
@@ -461,10 +479,10 @@ final class NetworkConnection {
             let sourceTrackedURL = MigratorFileURL(with: fileURL)
             if destinationTrackedURL.source == .unknown {
                 let infoData = SymbolicLinkMessage(source: sourceTrackedURL, absoluteDestination: MigratorFileURL(with: fileURL.deletingLastPathComponent()), relativeDestination: destinationPath)
-                symlinks.append(infoData)
+                await symlinksManager.append(infoData)
             } else {
                 let infoData = SymbolicLinkMessage(source: sourceTrackedURL, absoluteDestination: MigratorFileURL(with: URL(string: destinationPath)!))
-                symlinks.append(infoData)
+                await symlinksManager.append(infoData)
             }
             return
         }
@@ -585,9 +603,10 @@ final class NetworkConnection {
     /// Sends collected symbolic links to the connected device.
     private func sendSymlinks() async throws {
         logger.log("networkConnection.sendSymlinks: start sending collected symlinks")
-        for message in symlinks {
+        let linksToSend = await symlinksManager.takeAll()
+        for symlink in linksToSend {
             guard var data = "link".data(using: .utf8),
-                  let infoDataLenght = try? data.include(object: message) else {
+                  let infoDataLenght = try? data.include(object: symlink) else {
                 throw MigratorError.fileError(type: .noData)
             }
             let message = NWProtocolFramer.Message(migratorMessageType: .symlink, infoLenght: UInt32(infoDataLenght))
@@ -595,7 +614,6 @@ final class NetworkConnection {
                                                       metadata: [message])
             try await sendAsyncWrapper(content: data, contentContext: context)
         }
-        symlinks = []
         logger.log("networkConnection.sendSymlinks: done sending collected symlinks")
     }
     
